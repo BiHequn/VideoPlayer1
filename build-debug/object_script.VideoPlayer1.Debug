@@ -1,0 +1,14 @@
+debug/PacketQueue.o
+debug/main.o
+debug/logindialog.o
+debug/onlinedialog.o
+debug/videodialog.o
+debug/videoplayer.o
+debug/networkclient.o
+debug/myopenglwidget.o
+debug/moc_logindialog.o
+debug/moc_onlinedialog.o
+debug/moc_videodialog.o
+debug/moc_videoplayer.o
+debug/moc_networkclient.o
+debug/moc_myopenglwidget.o

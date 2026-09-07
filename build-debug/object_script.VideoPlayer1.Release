@@ -1,0 +1,14 @@
+release/PacketQueue.o
+release/main.o
+release/logindialog.o
+release/onlinedialog.o
+release/videodialog.o
+release/videoplayer.o
+release/networkclient.o
+release/myopenglwidget.o
+release/moc_logindialog.o
+release/moc_onlinedialog.o
+release/moc_videodialog.o
+release/moc_videoplayer.o
+release/moc_networkclient.o
+release/moc_myopenglwidget.o
