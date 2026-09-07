@@ -1,8 +1,15 @@
-﻿from fastapi import APIRouter, HTTPException, status
+﻿import secrets
+
+from fastapi import APIRouter, HTTPException, status
 
 from app import database
-from app.schemas import RegisterRequest, RegisterResponse
-from app.security import hash_password
+from app.schemas import (
+    LoginRequest,
+    LoginResponse,
+    RegisterRequest,
+    RegisterResponse,
+)
+from app.security import hash_password, verify_password
 
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -30,4 +37,29 @@ def register(payload: RegisterRequest) -> RegisterResponse:
     return RegisterResponse(
         message="registration successful",
         username=payload.username,
+    )
+
+
+@router.post(
+    "/login",
+    response_model=LoginResponse,
+)
+def login(payload: LoginRequest) -> LoginResponse:
+    database.initialize_database()
+
+    user = database.get_user_by_username(payload.username)
+
+    if user is None or not verify_password(
+        payload.password,
+        user["password_hash"],
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid username or password",
+        )
+
+    return LoginResponse(
+        message="login successful",
+        username=user["username"],
+        access_token=secrets.token_urlsafe(32),
     )
