@@ -2,11 +2,12 @@
 #define LOGINDIALOG_H
 
 #include <QDialog>
-#include <QSqlDatabase>
 #include <QSettings>
-#include <QTimer>
-#include <QDateTime>
 #include "network/networkclient.h"
+#include <QString>
+
+class QNetworkAccessManager;
+class QUrl;
 
 namespace Ui {
 class LoginDialog;
@@ -43,22 +44,16 @@ private slots:
 
 private:
     Ui::LoginDialog *ui;
-    QSqlDatabase m_db;
     QSettings m_settings;
     NetworkClient *m_netClient;
     bool m_manualConnectRequested;
 
-    bool initDatabase();
-    bool validateEmail(const QString &email);
-    bool validatePhone(const QString &phone);
-    QString currentLoginAccount() const;
-    void generateSmsCode();
     void loadRememberedUser();
     void saveRememberedUser();
+    QUrl apiUrl(const QString &path) const;
 
-    QString m_smsCode;
-    QTimer m_smsCodeTimer;
-    QDateTime m_smsCodeExpireAt;
+    QNetworkAccessManager *m_networkManager;
+    QString m_accessToken;
 };
 
 #endif
