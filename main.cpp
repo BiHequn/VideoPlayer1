@@ -29,37 +29,7 @@ int main(int argc, char *argv[])
     OnlineDialog onlineDlg(&netClient);
     VideoDialog videoDlg;
 
-    QString savedUsername = settings.value("login/username", "").toString();
-    bool rememberPassword = settings.value("login/rememberPassword", false).toBool();
-
-    if(rememberPassword && !savedUsername.isEmpty())
-    {
-        QString savedPassword = settings.value("login/password", "").toString();
-        QString savedAccessToken = settings.value("login/accessToken", "").toString();
-        QString savedRefreshToken = settings.value("login/refreshToken", "").toString();
-
-        if(!savedAccessToken.isEmpty() && netClient.isConnected())
-        {
-            netClient.setAccessToken(savedAccessToken);
-            netClient.setRefreshToken(savedRefreshToken);
-            netClient.refreshToken(savedRefreshToken);
-            onlineDlg.setLoginUser(savedUsername);
-            onlineDlg.show();
-        }
-        else if(loginDlg.tryAutoLogin(savedUsername, savedPassword))
-        {
-            onlineDlg.setLoginUser(savedUsername);
-            onlineDlg.show();
-        }
-        else
-        {
-            loginDlg.show();
-        }
-    }
-    else
-    {
-        loginDlg.show();
-    }
+    loginDlg.show();
 
     QObject::connect(&loginDlg, &LoginDialog::SIG_loginSuccess,
                      [&](const QString &username){
@@ -94,6 +64,7 @@ int main(int argc, char *argv[])
         netClient.setAccessToken("");
         netClient.setRefreshToken("");
         netClient.setUserId(0);
+        netClient.disconnectFromServer();
 
         onlineDlg.hide();
         videoDlg.hide();

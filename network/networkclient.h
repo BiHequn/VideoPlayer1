@@ -27,6 +27,7 @@ public:
     ~NetworkClient();
 
     void connectToServer(const QString &host, quint16 port);
+    void connectToServerWithAccessToken(const QString &host, quint16 port);
     void disconnectFromServer();
     bool isConnected() const;
 
@@ -37,6 +38,7 @@ public:
                       const QString &phone = QString());
     void login(const QString &username, const QString &password, const QString &account = QString());
     void refreshToken(const QString &refreshToken);
+    void authenticateWithAccessToken();
 
     void uploadFileInit(const QString &filename, qint64 filesize, const QString &fileMd5);
     void uploadFileChunk(int uploadId, const QString &fileMd5, qint64 offset, const QByteArray &chunkData);
@@ -71,6 +73,8 @@ signals:
     void loginResult(bool success, const QString &msg, int uid, const QString &username,
                      const QString &accessToken, const QString &refreshToken);
     void tokenRefreshResult(bool success, const QString &accessToken, const QString &refreshToken);
+    void accessTokenAuthResult(bool success, int uid, const QString &username,
+                               const QString &message);
 
     void uploadInitResult(const QString &result, int uploadId, qint64 uploadedSize, int chunkSize);
     void uploadChunkResult(int uploadId, qint64 uploadedSize);
@@ -109,6 +113,7 @@ private:
     QString m_host;
     quint16 m_port;
     bool m_isConnected;
+    bool m_authenticateOnConnect;
 
     QString m_accessToken;
     QString m_refreshToken;

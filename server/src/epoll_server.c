@@ -130,7 +130,8 @@ static char *generate_token(int uid, const char *secret, int expire_seconds) {
     return token;
 }
 
-static int verify_token(const char *token, const char *secret, int *out_uid) {
+static int verify_token_details(const char *token, const char *secret, int *out_uid,
+                                char *out_username, size_t username_size) {
     char *copy = strdup(token);
     char *saveptr;
     char *h_b64 = strtok_r(copy, ".", &saveptr);
@@ -172,17 +173,30 @@ static int verify_token(const char *token, const char *secret, int *out_uid) {
         return -1;
     }
 
-    json_object *j_exp, *j_uid;
-    json_object_object_get_ex(jobj, "exp", &j_exp);
-    json_object_object_get_ex(jobj, "uid", &j_uid);
+    json_object *j_exp, *j_uid, *j_username = NULL;
+    if (!json_object_object_get_ex(jobj, "exp", &j_exp) ||
+        !json_object_object_get_ex(jobj, "uid", &j_uid)) {
+        json_object_put(jobj);
+        free(copy);
+        return -1;
+    }
+    json_object_object_get_ex(jobj, "username", &j_username);
 
     time_t exp = (time_t)json_object_get_int64(j_exp);
     *out_uid = json_object_get_int(j_uid);
+    if (out_username && username_size > 0) {
+        const char *username = j_username ? json_object_get_string(j_username) : "";
+        snprintf(out_username, username_size, "%s", username);
+    }
     json_object_put(jobj);
     free(copy);
 
     if (time(NULL) > exp) return -2;
     return 0;
+}
+
+static int verify_token(const char *token, const char *secret, int *out_uid) {
+    return verify_token_details(token, secret, out_uid, NULL, 0);
 }
 
 static int init_database() {
@@ -265,6 +279,12 @@ static int init_database() {
         "viewer_count INTEGER DEFAULT 0,"
         "created_at TEXT NOT NULL)";
 
+    const char *sql_api_identities = "CREATE TABLE IF NOT EXISTS api_identities ("
+        "api_user_id INTEGER PRIMARY KEY,"
+        "media_user_id INTEGER NOT NULL UNIQUE,"
+        "created_at TEXT NOT NULL,"
+        "FOREIGN KEY(media_user_id) REFERENCES users(id))";
+
     sqlite3_exec(m_db, sql_users, NULL, NULL, NULL);
     sqlite3_exec(m_db, "ALTER TABLE users ADD COLUMN phone TEXT", NULL, NULL, NULL);
     sqlite3_exec(m_db, sql_videos, NULL, NULL, NULL);
@@ -279,6 +299,7 @@ static int init_database() {
         "SELECT user_id, video_id, 'like', 10, created_at FROM user_likes",
         NULL, NULL, NULL);
     sqlite3_exec(m_db, sql_streams, NULL, NULL, NULL);
+    sqlite3_exec(m_db, sql_api_identities, NULL, NULL, NULL);
 
     return 0;
 }
@@ -453,6 +474,104 @@ static void handle_heartbeat(int fd, const char *data, int len, conn_info_t *con
     json_object_object_add(resp, "result", json_object_new_string("ok"));
     json_object_object_add(resp, "server_time", json_object_new_int64((long long)time(NULL)));
     send_json_response(fd, CMD_HEARTBEAT_RESP, resp);
+    json_object_put(resp);
+}
+
+static void handle_api_token_auth(int fd, const char *data, int len, conn_info_t *conn) {
+    (void)len;
+    json_object *jobj = json_tokener_parse(data);
+    if (!jobj) return;
+
+    json_object *j_token = NULL;
+    json_object_object_get_ex(jobj, "access_token", &j_token);
+    const char *access_token = j_token ? json_object_get_string(j_token) : "";
+
+    json_object *resp = json_object_new_object();
+    int api_uid = 0;
+    char username[128] = {0};
+    int rc = verify_token_details(access_token, JWT_SECRET, &api_uid,
+                                  username, sizeof(username));
+
+    if (rc == 0 && api_uid > 0 && username[0] != '\0') {
+        sqlite3_stmt *stmt = NULL;
+        int media_uid = 0;
+        if (sqlite3_prepare_v2(m_db,
+                               "SELECT media_user_id FROM api_identities WHERE api_user_id = ?",
+                               -1,
+                               &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, api_uid);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                media_uid = sqlite3_column_int(stmt, 0);
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        if (media_uid <= 0) {
+            char media_username[192];
+            char email[256];
+            char timebuf[64];
+            snprintf(media_username, sizeof(media_username), "%s", username);
+            snprintf(email, sizeof(email), "api-%d@api.local", api_uid);
+            time_t now = time(NULL);
+            strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+            if (sqlite3_prepare_v2(m_db, "SELECT id FROM users WHERE username = ?", -1,
+                                   &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, media_username, -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt) == SQLITE_ROW) {
+                    snprintf(media_username, sizeof(media_username), "%s_api_%d",
+                             username, api_uid);
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            if (sqlite3_prepare_v2(
+                    m_db,
+                    "INSERT INTO users (username, email, password, salt, created_at) "
+                    "VALUES (?, ?, '', '', ?)",
+                    -1, &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(stmt, 1, media_username, -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 2, email, -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt, 3, timebuf, -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt) == SQLITE_DONE) {
+                    media_uid = (int)sqlite3_last_insert_rowid(m_db);
+                }
+                sqlite3_finalize(stmt);
+            }
+
+            if (media_uid > 0 && sqlite3_prepare_v2(
+                    m_db,
+                    "INSERT INTO api_identities (api_user_id, media_user_id, created_at) "
+                    "VALUES (?, ?, ?)",
+                    -1, &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, api_uid);
+                sqlite3_bind_int(stmt, 2, media_uid);
+                sqlite3_bind_text(stmt, 3, timebuf, -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt) != SQLITE_DONE) {
+                    media_uid = 0;
+                }
+                sqlite3_finalize(stmt);
+            }
+        }
+
+        if (media_uid > 0) {
+            conn->uid = media_uid;
+            snprintf(conn->access_token, sizeof(conn->access_token), "%s", access_token);
+            json_object_object_add(resp, "result", json_object_new_string("ok"));
+            json_object_object_add(resp, "uid", json_object_new_int(media_uid));
+            json_object_object_add(resp, "username", json_object_new_string(username));
+        } else {
+            json_object_object_add(resp, "result", json_object_new_string("fail"));
+            json_object_object_add(resp, "msg", json_object_new_string("无法创建媒体用户"));
+        }
+    } else {
+        json_object_object_add(resp, "result", json_object_new_string("fail"));
+        json_object_object_add(resp, "msg", json_object_new_string(
+            rc == -2 ? "登录令牌已过期" : "无效的登录令牌"));
+    }
+
+    json_object_put(jobj);
+    send_json_response(fd, CMD_API_TOKEN_AUTH_RESP, resp);
     json_object_put(resp);
 }
 
@@ -1415,6 +1534,7 @@ void server_run(const char *ip, int port) {
     register_msg_handler(CMD_REGISTER, handle_register);
     register_msg_handler(CMD_LOGIN, handle_login);
     register_msg_handler(CMD_HEARTBEAT, handle_heartbeat);
+    register_msg_handler(CMD_API_TOKEN_AUTH, handle_api_token_auth);
     register_msg_handler(CMD_TOKEN_REFRESH, handle_token_refresh);
     register_msg_handler(CMD_UPLOAD_INIT, handle_upload_init);
     register_msg_handler(CMD_UPLOAD_CHUNK, handle_upload_chunk);

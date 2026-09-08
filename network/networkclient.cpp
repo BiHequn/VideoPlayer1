@@ -15,6 +15,7 @@ NetworkClient::NetworkClient(QObject *parent)
     , m_requestTimer(new QTimer(this))
     , m_port(0)
     , m_isConnected(false)
+    , m_authenticateOnConnect(false)
     , m_userId(0)
     , m_currentUploadId(0)
     , m_uploadFileSize(0)
@@ -51,6 +52,18 @@ NetworkClient::~NetworkClient()
 
 void NetworkClient::connectToServer(const QString &host, quint16 port)
 {
+    m_authenticateOnConnect = false;
+    m_host = host;
+    m_port = port;
+    if (m_socket->state() != QAbstractSocket::UnconnectedState) {
+        m_socket->abort();
+    }
+    m_socket->connectToHost(host, port);
+}
+
+void NetworkClient::connectToServerWithAccessToken(const QString &host, quint16 port)
+{
+    m_authenticateOnConnect = true;
     m_host = host;
     m_port = port;
     if (m_socket->state() != QAbstractSocket::UnconnectedState) {
@@ -64,6 +77,9 @@ void NetworkClient::disconnectFromServer()
     m_heartbeatTimer->stop();
     m_reconnectTimer->stop();
     m_requestTimer->stop();
+    m_host.clear();
+    m_port = 0;
+    m_authenticateOnConnect = false;
     m_socket->disconnectFromHost();
 }
 
@@ -78,6 +94,9 @@ void NetworkClient::onSocketConnected()
     m_retryCount = 0;
     m_heartbeatTimer->start(NET_HEARTBEAT_INTERVAL);
     emit serverConnected();
+    if (m_authenticateOnConnect && !m_accessToken.isEmpty()) {
+        authenticateWithAccessToken();
+    }
 }
 
 void NetworkClient::onSocketDisconnected()
@@ -152,7 +171,7 @@ void NetworkClient::sendMessage(int cmd, const QJsonObject &data)
 {
     QJsonObject msg = data;
     msg["cmd"] = cmd;
-    if (!m_accessToken.isEmpty() && cmd != 1 && cmd != 2 && cmd != 4) {
+    if (!m_accessToken.isEmpty() && cmd != 1 && cmd != 2 && cmd != 4 && cmd != 6) {
         msg["access_token"] = m_accessToken;
     }
 
@@ -240,6 +259,16 @@ void NetworkClient::handleResponse(int cmd, const QJsonObject &resp)
         break;
     }
     case 1005: {
+        break;
+    }
+    case 1006: {
+        const bool ok = resp["result"].toString() == "ok";
+        if (ok) {
+            m_userId = resp["uid"].toInt();
+        }
+        emit accessTokenAuthResult(ok, resp["uid"].toInt(),
+                                   resp["username"].toString(),
+                                   resp["msg"].toString());
         break;
     }
     case 1010: {
@@ -332,6 +361,17 @@ void NetworkClient::refreshToken(const QString &rt)
     QJsonObject data;
     data["refresh_token"] = rt;
     sendRequest(4, data);
+}
+
+void NetworkClient::authenticateWithAccessToken()
+{
+    if (m_accessToken.isEmpty()) {
+        emit accessTokenAuthResult(false, 0, QString(), "访问令牌为空");
+        return;
+    }
+    QJsonObject data;
+    data["access_token"] = m_accessToken;
+    sendRequestWithRetry(6, data);
 }
 
 void NetworkClient::uploadFileInit(const QString &filename, qint64 filesize, const QString &fileMd5)

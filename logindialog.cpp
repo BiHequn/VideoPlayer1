@@ -13,6 +13,7 @@
 namespace {
 const char kDefaultApiHost[] = "127.0.0.1";
 const int kDefaultApiPort = 8000;
+const int kDefaultMediaPort = 8888;
 
 QString responseDetail(const QByteArray &body)
 {
@@ -26,8 +27,8 @@ LoginDialog::LoginDialog(NetworkClient *netClient, QWidget *parent)
     , ui(new Ui::LoginDialog)
     , m_settings("VideoPlayer", "VideoPlayer1")
     , m_netClient(netClient)
-    , m_manualConnectRequested(false)
     , m_networkManager(new QNetworkAccessManager(this))
+    , m_waitingForMediaAuthentication(false)
 {
     ui->setupUi(this);
     this->setWindowTitle("用户登录");
@@ -36,7 +37,17 @@ LoginDialog::LoginDialog(NetworkClient *netClient, QWidget *parent)
     ui->le_serverHost->setText(serverHost);
     ui->le_serverPort->setText(QString::number(m_settings.value("api/port", kDefaultApiPort).toInt()));
     ui->le_serverPort->setValidator(new QIntValidator(1, 65535, this));
+    ui->le_mediaPort->setText(QString::number(m_settings.value("media/port", kDefaultMediaPort).toInt()));
+    ui->le_mediaPort->setValidator(new QIntValidator(1, 65535, this));
     loadRememberedUser();
+    if (m_netClient) {
+        connect(m_netClient, &NetworkClient::accessTokenAuthResult,
+                this, &LoginDialog::onAccessTokenAuthResult);
+        connect(m_netClient, &NetworkClient::connectionError,
+                this, &LoginDialog::onConnectionError);
+        connect(m_netClient, &NetworkClient::serverDisconnected,
+                this, &LoginDialog::onMediaServerDisconnected);
+    }
 }
 
 LoginDialog::~LoginDialog()
@@ -77,12 +88,27 @@ void LoginDialog::on_pb_login_clicked()
 {
     QString username = ui->le_loginUser->text().trimmed();
     QString password = ui->le_loginPwd->text();
+    const QString host = ui->le_serverHost->text().trimmed();
+    const int apiPort = ui->le_serverPort->text().toInt();
+    const int mediaPort = ui->le_mediaPort->text().toInt();
 
     if(username.isEmpty() || password.isEmpty())
     {
         QMessageBox::warning(this, "提示", "用户名和密码不能为空");
         return;
     }
+
+    if(host.isEmpty() || apiPort <= 0 || apiPort > 65535 ||
+       mediaPort <= 0 || mediaPort > 65535)
+    {
+        QMessageBox::warning(this, "提示", "请输入正确的服务器地址和端口");
+        return;
+    }
+
+    m_settings.setValue("api/host", host);
+    m_settings.setValue("api/port", apiPort);
+    m_settings.setValue("media/port", mediaPort);
+    m_settings.sync();
 
     QJsonObject body;
     body["username"] = username;
@@ -114,14 +140,27 @@ void LoginDialog::on_pb_login_clicked()
             reply->deleteLater();
             return;
         }
-        if (m_netClient) {
-            m_netClient->setAccessToken(m_accessToken);
-            m_netClient->setRefreshToken(QString());
-            m_netClient->setUserId(0);
+        if (!m_netClient) {
+            QMessageBox::warning(this, "登录失败", "媒体服务客户端不可用。");
+            reply->deleteLater();
+            return;
         }
-        saveRememberedUser();
-        emit SIG_loginSuccess(username);
-        accept();
+
+        m_pendingUsername = username;
+        m_waitingForMediaAuthentication = true;
+        m_netClient->setAccessToken(m_accessToken);
+        m_netClient->setRefreshToken(QString());
+        m_netClient->setUserId(0);
+        ui->pb_login->setEnabled(false);
+
+        const QString mediaHost = ui->le_serverHost->text().trimmed();
+        const int mediaPort = ui->le_mediaPort->text().toInt();
+        if (m_netClient->isConnected()) {
+            m_netClient->authenticateWithAccessToken();
+        } else {
+            m_netClient->connectToServerWithAccessToken(
+                mediaHost, static_cast<quint16>(mediaPort));
+        }
         reply->deleteLater();
     });
 }
@@ -203,8 +242,10 @@ void LoginDialog::on_pb_connectServer_clicked()
 {
     QString host = ui->le_serverHost->text().trimmed();
     int port = ui->le_serverPort->text().toInt();
+    int mediaPort = ui->le_mediaPort->text().toInt();
 
-    if(host.isEmpty() || port <= 0 || port > 65535)
+    if(host.isEmpty() || port <= 0 || port > 65535 ||
+       mediaPort <= 0 || mediaPort > 65535)
     {
         QMessageBox::warning(this, "提示", "请输入正确的服务器地址和端口");
         return;
@@ -212,9 +253,9 @@ void LoginDialog::on_pb_connectServer_clicked()
 
     m_settings.setValue("api/host", host);
     m_settings.setValue("api/port", port);
+    m_settings.setValue("media/port", mediaPort);
     m_settings.sync();
 
-    m_manualConnectRequested = true;
     ui->pb_connectServer->setEnabled(false);
     ui->pb_connectServer->setText("检测中...");
     QNetworkReply *reply = m_networkManager->get(QNetworkRequest(apiUrl("/health")));
@@ -225,7 +266,6 @@ void LoginDialog::on_pb_connectServer_clicked()
                              && document.object().value("status").toString() == "ok";
         ui->pb_connectServer->setEnabled(true);
         ui->pb_connectServer->setText("检测 API 服务");
-        m_manualConnectRequested = false;
         if (healthy) {
             QMessageBox::information(this, "提示", "API 服务连接成功。");
         } else {
@@ -237,66 +277,20 @@ void LoginDialog::on_pb_connectServer_clicked()
     });
 }
 
-void LoginDialog::onRegisterResult(bool success, const QString &msg)
-{
-    ui->pb_register->setEnabled(true);
-    if(success)
-    {
-        QMessageBox::information(this, "成功", "注册成功，请登录");
-        ui->stackedWidget->setCurrentIndex(0);
-    }
-    else
-    {
-        QMessageBox::warning(this, "注册失败", msg);
-    }
-}
-
-void LoginDialog::onLoginResult(bool success, const QString &msg, int uid, const QString &username,
-                                const QString &accessToken, const QString &refreshToken)
-{
-    ui->pb_login->setEnabled(true);
-    if(success)
-    {
-        m_netClient->setUserId(uid);
-        m_netClient->setAccessToken(accessToken);
-        m_netClient->setRefreshToken(refreshToken);
-        saveRememberedUser();
-        emit SIG_loginSuccess(username);
-        this->accept();
-    }
-    else
-    {
-        QMessageBox::warning(this, "登录失败", msg);
-    }
-}
-
-void LoginDialog::onServerConnected()
-{
-    ui->pb_connectServer->setEnabled(true);
-    ui->pb_connectServer->setText("检测 API 服务");
-    if(m_manualConnectRequested)
-    {
-        m_manualConnectRequested = false;
-        QMessageBox::information(this, "提示", "服务器连接成功");
-    }
-}
-
-void LoginDialog::onServerDisconnected()
-{
-    ui->pb_connectServer->setEnabled(true);
-    ui->pb_connectServer->setText("检测 API 服务");
-    ui->pb_login->setEnabled(true);
-    ui->pb_register->setEnabled(true);
-    m_manualConnectRequested = false;
-}
-
 void LoginDialog::onConnectionError(const QString &error)
 {
     ui->pb_login->setEnabled(true);
     ui->pb_register->setEnabled(true);
     ui->pb_connectServer->setEnabled(true);
     ui->pb_connectServer->setText("检测 API 服务");
-    m_manualConnectRequested = false;
+    if (m_waitingForMediaAuthentication) {
+        m_waitingForMediaAuthentication = false;
+        m_pendingUsername.clear();
+        m_netClient->disconnectFromServer();
+        QMessageBox::warning(this, "登录失败",
+                             QString("API 登录成功，但媒体服务连接失败：%1").arg(error));
+        return;
+    }
     if(error.contains("remote host closed", Qt::CaseInsensitive))
     {
         return;
@@ -304,28 +298,51 @@ void LoginDialog::onConnectionError(const QString &error)
     QMessageBox::warning(this, "网络错误", error);
 }
 
+void LoginDialog::onAccessTokenAuthResult(bool success, int uid, const QString &username,
+                                          const QString &message)
+{
+    if (!m_waitingForMediaAuthentication) {
+        return;
+    }
+
+    m_waitingForMediaAuthentication = false;
+    ui->pb_login->setEnabled(true);
+    if (!success) {
+        m_pendingUsername.clear();
+        m_netClient->disconnectFromServer();
+        QMessageBox::warning(this, "登录失败",
+                             message.isEmpty() ? "媒体服务拒绝了登录令牌。" : message);
+        return;
+    }
+
+    m_netClient->setUserId(uid);
+    const QString authenticatedUsername = username.isEmpty() ? m_pendingUsername : username;
+    m_pendingUsername.clear();
+    saveRememberedUser();
+    emit SIG_loginSuccess(authenticatedUsername);
+    accept();
+}
+
+void LoginDialog::onMediaServerDisconnected()
+{
+    if (!m_waitingForMediaAuthentication) {
+        return;
+    }
+
+    m_waitingForMediaAuthentication = false;
+    m_pendingUsername.clear();
+    ui->pb_login->setEnabled(true);
+    QMessageBox::warning(this, "登录失败", "媒体服务在登录验证期间断开连接。");
+}
+
 void LoginDialog::clearFields()
 {
     ui->le_loginUser->clear();
-    ui->le_loginEmail->clear();
     ui->le_loginPwd->clear();
     ui->le_regUser->clear();
-    ui->le_regEmail->clear();
     ui->le_regPwd->clear();
     ui->le_regPwdConfirm->clear();
     ui->stackedWidget->setCurrentIndex(0);
-}
-
-bool LoginDialog::tryAutoLogin(const QString &username, const QString &password)
-{
-    Q_UNUSED(username);
-    Q_UNUSED(password);
-    return false;
-}
-
-void LoginDialog::setNetworkClient(NetworkClient *client)
-{
-    m_netClient = client;
 }
 
 QUrl LoginDialog::apiUrl(const QString &path) const

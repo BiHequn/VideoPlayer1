@@ -1,7 +1,14 @@
+import base64
+import hashlib
+import hmac
+import json
+import time
+
 from fastapi.testclient import TestClient
 
 from app import database
 from app.main import app
+from app.security import ACCESS_TOKEN_SECRET
 
 
 def register_test_user(client: TestClient) -> None:
@@ -39,6 +46,22 @@ def test_login_succeeds_with_valid_credentials(tmp_path, monkeypatch) -> None:
     assert body["token_type"] == "bearer"
     assert isinstance(body["access_token"], str)
     assert len(body["access_token"]) > 20
+
+    header_part, payload_part, signature_part = body["access_token"].split(".")
+    signing_input = f"{header_part}.{payload_part}"
+    expected_signature = base64.b64encode(
+        hmac.new(
+            ACCESS_TOKEN_SECRET,
+            signing_input.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("ascii")
+    payload = json.loads(base64.b64decode(payload_part))
+
+    assert hmac.compare_digest(signature_part, expected_signature)
+    assert payload["uid"] > 0
+    assert payload["username"] == "testuser"
+    assert payload["exp"] > int(time.time())
 
 
 def test_login_rejects_wrong_password(tmp_path, monkeypatch) -> None:

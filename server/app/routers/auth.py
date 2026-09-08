@@ -1,5 +1,3 @@
-﻿import secrets
-
 from fastapi import APIRouter, HTTPException, status
 
 from app import database
@@ -9,7 +7,7 @@ from app.schemas import (
     RegisterRequest,
     RegisterResponse,
 )
-from app.security import hash_password, verify_password
+from app.security import create_access_token, hash_password, verify_password
 
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -61,5 +59,5 @@ def login(payload: LoginRequest) -> LoginResponse:
     return LoginResponse(
         message="login successful",
         username=user["username"],
-        access_token=secrets.token_urlsafe(32),
+        access_token=create_access_token(user["id"], user["username"]),
     )
