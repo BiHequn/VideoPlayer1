@@ -4,6 +4,8 @@
 #include <QFileInfo>
 #include <QDateTime>
 #include <QDebug>
+#include <QDir>
+#include <QStandardPaths>
 
 static const char *AES_KEY = "VideoPlayer2026!";
 
@@ -13,6 +15,7 @@ NetworkClient::NetworkClient(QObject *parent)
     , m_heartbeatTimer(new QTimer(this))
     , m_reconnectTimer(new QTimer(this))
     , m_requestTimer(new QTimer(this))
+    , m_downloadRequestTimer(new QTimer(this))
     , m_port(0)
     , m_isConnected(false)
     , m_authenticateOnConnect(false)
@@ -22,6 +25,12 @@ NetworkClient::NetworkClient(QObject *parent)
     , m_uploadedSize(0)
     , m_chunkSize(NET_CHUNK_SIZE)
     , m_uploadFile(nullptr)
+    , m_downloadVideoId(0)
+    , m_downloadFileSize(0)
+    , m_downloadedSize(0)
+    , m_downloadChunkSize(32 * 1024)
+    , m_downloadFile(nullptr)
+    , m_downloadRetryCount(0)
     , m_retryCount(0)
     , m_lastCmd(0)
 {
@@ -36,9 +45,12 @@ NetworkClient::NetworkClient(QObject *parent)
     connect(m_heartbeatTimer, &QTimer::timeout, this, &NetworkClient::onHeartbeat);
     connect(m_reconnectTimer, &QTimer::timeout, this, &NetworkClient::onReconnectTimeout);
     connect(m_requestTimer, &QTimer::timeout, this, &NetworkClient::onRequestTimeout);
+    connect(m_downloadRequestTimer, &QTimer::timeout,
+            this, &NetworkClient::onDownloadRequestTimeout);
 
     m_reconnectTimer->setSingleShot(true);
     m_requestTimer->setSingleShot(true);
+    m_downloadRequestTimer->setSingleShot(true);
 }
 
 NetworkClient::~NetworkClient()
@@ -46,6 +58,10 @@ NetworkClient::~NetworkClient()
     if (m_uploadFile) {
         m_uploadFile->close();
         delete m_uploadFile;
+    }
+    if (m_downloadFile) {
+        m_downloadFile->close();
+        delete m_downloadFile;
     }
     disconnectFromServer();
 }
@@ -77,6 +93,7 @@ void NetworkClient::disconnectFromServer()
     m_heartbeatTimer->stop();
     m_reconnectTimer->stop();
     m_requestTimer->stop();
+    m_downloadRequestTimer->stop();
     m_host.clear();
     m_port = 0;
     m_authenticateOnConnect = false;
@@ -105,6 +122,9 @@ void NetworkClient::onSocketDisconnected()
     m_heartbeatTimer->stop();
     m_requestTimer->stop();
     emit serverDisconnected();
+    if (m_downloadVideoId > 0) {
+        failVideoDownload("媒体服务连接已断开。");
+    }
 
     if (!m_host.isEmpty() && m_port > 0) {
         m_reconnectTimer->start(NET_RECONNECT_INTERVAL);
@@ -146,6 +166,20 @@ void NetworkClient::onRequestTimeout()
         m_retryCount = 0;
         emit connectionError("请求超时，重试次数已达上限");
     }
+}
+
+void NetworkClient::onDownloadRequestTimeout()
+{
+    if (m_downloadVideoId <= 0) {
+        return;
+    }
+    if (m_downloadRetryCount >= NET_MAX_RETRY) {
+        failVideoDownload("视频下载请求超时。");
+        return;
+    }
+    ++m_downloadRetryCount;
+    sendMessage(m_lastDownloadRequest["cmd"].toInt(), m_lastDownloadRequest);
+    m_downloadRequestTimer->start(NET_REQUEST_TIMEOUT);
 }
 
 void NetworkClient::sendRequest(int cmd, const QJsonObject &data)
@@ -228,8 +262,10 @@ void NetworkClient::onReadyRead()
 
 void NetworkClient::handleResponse(int cmd, const QJsonObject &resp)
 {
-    m_requestTimer->stop();
-    m_retryCount = 0;
+    if (cmd != 1023 && cmd != 1024) {
+        m_requestTimer->stop();
+        m_retryCount = 0;
+    }
 
     switch (cmd) {
     case 1001: {
@@ -303,6 +339,113 @@ void NetworkClient::handleResponse(int cmd, const QJsonObject &resp)
     case 1012: {
         bool ok = resp["result"].toString() == "ok";
         emit uploadFinishResult(ok, resp["filepath"].toString());
+        break;
+    }
+    case 1023: {
+        m_downloadRequestTimer->stop();
+        m_downloadRetryCount = 0;
+        if (m_downloadVideoId <= 0) {
+            break;
+        }
+        if (resp["result"].toString() != "ok") {
+            failVideoDownload(resp["msg"].toString());
+            break;
+        }
+
+        m_downloadFileName = QFileInfo(resp["filename"].toString()).fileName();
+        m_downloadFileSize = resp["filesize"].toVariant().toLongLong();
+        m_downloadFileMd5 = resp["file_md5"].toString().toLower();
+        m_downloadChunkSize = resp["chunk_size"].toInt(32 * 1024);
+        if (m_downloadFileName.isEmpty() || m_downloadFileSize <= 0 ||
+            m_downloadFileMd5.isEmpty() || m_downloadChunkSize <= 0) {
+            failVideoDownload("服务端返回了无效的下载信息。");
+            break;
+        }
+
+        const QString cacheRoot = QStandardPaths::writableLocation(
+            QStandardPaths::CacheLocation) + "/videos";
+        if (!QDir().mkpath(cacheRoot)) {
+            failVideoDownload("无法创建视频缓存目录。");
+            break;
+        }
+        const QString suffix = QFileInfo(m_downloadFileName).suffix();
+        const QString cacheName = QString::number(m_downloadVideoId) + "_" +
+                                  m_downloadFileMd5 +
+                                  (suffix.isEmpty() ? QString() : "." + suffix);
+        m_downloadFinalPath = QDir(cacheRoot).filePath(cacheName);
+        m_downloadPartialPath = m_downloadFinalPath + ".part";
+
+        if (verifyDownloadedFile(m_downloadFinalPath, m_downloadFileSize,
+                                 m_downloadFileMd5)) {
+            const int videoId = m_downloadVideoId;
+            m_downloadVideoId = 0;
+            emit videoDownloadProgress(videoId, 100);
+            emit videoDownloadFinished(videoId, m_downloadFinalPath);
+            break;
+        }
+        QFile::remove(m_downloadFinalPath);
+        QFile::remove(m_downloadPartialPath);
+        m_downloadFile = new QFile(m_downloadPartialPath);
+        if (!m_downloadFile->open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            failVideoDownload("无法创建视频缓存文件。");
+            break;
+        }
+        m_downloadedSize = 0;
+        emit videoDownloadProgress(m_downloadVideoId, 0);
+        requestNextDownloadChunk();
+        break;
+    }
+    case 1024: {
+        m_downloadRequestTimer->stop();
+        m_downloadRetryCount = 0;
+        if (m_downloadVideoId <= 0 || !m_downloadFile) {
+            break;
+        }
+        if (resp["result"].toString() != "ok") {
+            failVideoDownload(resp["msg"].toString());
+            break;
+        }
+
+        const int responseVideoId = resp["video_id"].toInt();
+        const qint64 offset = resp["offset"].toVariant().toLongLong();
+        const QByteArray chunk = QByteArray::fromBase64(resp["data"].toString().toLatin1());
+        if (responseVideoId != m_downloadVideoId || offset != m_downloadedSize ||
+            chunk.isEmpty() || m_downloadedSize + chunk.size() > m_downloadFileSize) {
+            failVideoDownload("服务端返回了无效的视频分片。");
+            break;
+        }
+        if (m_downloadFile->write(chunk) != chunk.size()) {
+            failVideoDownload("写入视频缓存失败。");
+            break;
+        }
+
+        m_downloadedSize += chunk.size();
+        const int percent = static_cast<int>(
+            (m_downloadedSize * 100) / m_downloadFileSize);
+        emit videoDownloadProgress(m_downloadVideoId, percent);
+        const bool eof = resp["eof"].toBool();
+        if (eof || m_downloadedSize == m_downloadFileSize) {
+            m_downloadFile->close();
+            delete m_downloadFile;
+            m_downloadFile = nullptr;
+            if (m_downloadedSize != m_downloadFileSize ||
+                !verifyDownloadedFile(m_downloadPartialPath, m_downloadFileSize,
+                                      m_downloadFileMd5)) {
+                failVideoDownload("视频文件校验失败。");
+                break;
+            }
+            QFile::remove(m_downloadFinalPath);
+            if (!QFile::rename(m_downloadPartialPath, m_downloadFinalPath)) {
+                failVideoDownload("无法保存已下载的视频。", false);
+                break;
+            }
+            const int videoId = m_downloadVideoId;
+            const QString localPath = m_downloadFinalPath;
+            m_downloadVideoId = 0;
+            emit videoDownloadFinished(videoId, localPath);
+        } else {
+            requestNextDownloadChunk();
+        }
         break;
     }
     case 1030: {
@@ -472,6 +615,108 @@ void NetworkClient::resumeUpload(int uploadId, const QString &fileMd5, qint64 up
     m_uploadFile->seek(uploadedSize);
 
     sendNextUploadChunk();
+}
+
+void NetworkClient::startVideoDownload(int videoId)
+{
+    if (videoId <= 0) {
+        emit videoDownloadFailed(videoId, "无效的视频编号。");
+        return;
+    }
+    if (!m_isConnected || m_userId <= 0) {
+        emit videoDownloadFailed(videoId, "当前未登录媒体服务。");
+        return;
+    }
+    if (m_downloadVideoId > 0) {
+        emit videoDownloadFailed(videoId, "已有视频正在下载，请稍候。");
+        return;
+    }
+
+    m_downloadVideoId = videoId;
+    m_downloadFileSize = 0;
+    m_downloadedSize = 0;
+    m_downloadFileMd5.clear();
+    m_downloadFileName.clear();
+    m_downloadFinalPath.clear();
+    m_downloadPartialPath.clear();
+    QJsonObject data;
+    data["video_id"] = videoId;
+    data["cmd"] = 23;
+    m_lastDownloadRequest = data;
+    m_downloadRetryCount = 0;
+    sendMessage(23, data);
+    m_downloadRequestTimer->start(NET_REQUEST_TIMEOUT);
+}
+
+void NetworkClient::cancelVideoDownload()
+{
+    if (m_downloadVideoId <= 0) {
+        return;
+    }
+    m_requestTimer->stop();
+    m_downloadRequestTimer->stop();
+    m_retryCount = 0;
+    failVideoDownload("下载已取消。");
+}
+
+void NetworkClient::requestNextDownloadChunk()
+{
+    if (m_downloadVideoId <= 0 || !m_downloadFile ||
+        m_downloadedSize >= m_downloadFileSize) {
+        return;
+    }
+    QJsonObject data;
+    data["video_id"] = m_downloadVideoId;
+    data["offset"] = QString::number(m_downloadedSize);
+    const qint64 remaining = m_downloadFileSize - m_downloadedSize;
+    data["size"] = static_cast<int>(
+        qMin<qint64>(m_downloadChunkSize, remaining));
+    data["cmd"] = 24;
+    m_lastDownloadRequest = data;
+    m_downloadRetryCount = 0;
+    sendMessage(24, data);
+    m_downloadRequestTimer->start(NET_REQUEST_TIMEOUT);
+}
+
+void NetworkClient::failVideoDownload(const QString &message, bool removePartialFile)
+{
+    const int videoId = m_downloadVideoId;
+    m_requestTimer->stop();
+    m_downloadRequestTimer->stop();
+    m_retryCount = 0;
+    if (m_downloadFile) {
+        m_downloadFile->close();
+        delete m_downloadFile;
+        m_downloadFile = nullptr;
+    }
+    if (removePartialFile && !m_downloadPartialPath.isEmpty()) {
+        QFile::remove(m_downloadPartialPath);
+    }
+    m_downloadVideoId = 0;
+    m_downloadFileSize = 0;
+    m_downloadedSize = 0;
+    m_downloadFileMd5.clear();
+    m_downloadFileName.clear();
+    m_downloadFinalPath.clear();
+    m_downloadPartialPath.clear();
+    m_lastDownloadRequest = QJsonObject();
+    emit videoDownloadFailed(videoId,
+                             message.isEmpty() ? "视频下载失败。" : message);
+}
+
+bool NetworkClient::verifyDownloadedFile(const QString &path, qint64 expectedSize,
+                                         const QString &expectedMd5) const
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() != expectedSize) {
+        return false;
+    }
+    QCryptographicHash hash(QCryptographicHash::Md5);
+    if (!hash.addData(&file)) {
+        return false;
+    }
+    return QString::fromLatin1(hash.result().toHex()).compare(
+               expectedMd5, Qt::CaseInsensitive) == 0;
 }
 
 void NetworkClient::requestVideoList()

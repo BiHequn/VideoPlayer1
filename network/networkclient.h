@@ -46,6 +46,8 @@ public:
 
     void startChunkedUpload(const QString &filePath);
     void resumeUpload(int uploadId, const QString &fileMd5, qint64 uploadedSize, const QString &filePath);
+    void startVideoDownload(int videoId);
+    void cancelVideoDownload();
 
     void requestVideoList();
     void requestVideoRecommend();
@@ -80,6 +82,9 @@ signals:
     void uploadChunkResult(int uploadId, qint64 uploadedSize);
     void uploadFinishResult(bool success, const QString &filepath);
     void uploadProgress(int percent);
+    void videoDownloadProgress(int videoId, int percent);
+    void videoDownloadFinished(int videoId, const QString &localPath);
+    void videoDownloadFailed(int videoId, const QString &message);
 
     void videoListReceived(const QJsonArray &videos);
     void videoRecommendReceived(const QJsonArray &videos);
@@ -96,17 +101,23 @@ private slots:
     void onHeartbeat();
     void onReconnectTimeout();
     void onRequestTimeout();
+    void onDownloadRequestTimeout();
 
 private:
     void processBuffer();
     void sendMessage(int cmd, const QJsonObject &data);
     void handleResponse(int cmd, const QJsonObject &resp);
     void sendNextUploadChunk();
+    void requestNextDownloadChunk();
+    void failVideoDownload(const QString &message, bool removePartialFile = true);
+    bool verifyDownloadedFile(const QString &path, qint64 expectedSize,
+                              const QString &expectedMd5) const;
 
     QTcpSocket *m_socket;
     QTimer *m_heartbeatTimer;
     QTimer *m_reconnectTimer;
     QTimer *m_requestTimer;
+    QTimer *m_downloadRequestTimer;
 
     QByteArray m_recvBuffer;
 
@@ -126,6 +137,18 @@ private:
     int m_chunkSize;
     QString m_uploadFileMd5;
     QFile *m_uploadFile;
+
+    int m_downloadVideoId;
+    qint64 m_downloadFileSize;
+    qint64 m_downloadedSize;
+    int m_downloadChunkSize;
+    QString m_downloadFileMd5;
+    QString m_downloadFileName;
+    QString m_downloadFinalPath;
+    QString m_downloadPartialPath;
+    QFile *m_downloadFile;
+    int m_downloadRetryCount;
+    QJsonObject m_lastDownloadRequest;
 
     int m_retryCount;
     int m_lastCmd;

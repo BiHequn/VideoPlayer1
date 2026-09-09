@@ -1,3 +1,5 @@
+#define _FILE_OFFSET_BITS 64
+
 #include "epoll_server.h"
 #include "protocol.h"
 #include <json-c/json.h>
@@ -10,6 +12,7 @@
 #include <openssl/buffer.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <poll.h>
 #include <math.h>
 
 static int m_epollfd = -1;
@@ -28,6 +31,7 @@ static const char *NET_XOR_KEY = "VideoPlayer2026!";
 #define RECOMMEND_LIMIT 50
 #define CF_LIMIT 20
 #define MIN_CF_ACTIONS 2
+#define DOWNLOAD_CHUNK_SIZE (32 * 1024)
 
 static char *base64_encode(const unsigned char *input, int length) {
     BIO *bmem, *b64;
@@ -304,20 +308,53 @@ static int init_database() {
     return 0;
 }
 
+static int send_all(int fd, const char *buffer, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t result = send(fd, buffer + sent, length - sent, MSG_NOSIGNAL);
+        if (result > 0) {
+            sent += (size_t)result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd writable;
+            writable.fd = fd;
+            writable.events = POLLOUT;
+            writable.revents = 0;
+            int poll_result = poll(&writable, 1, 5000);
+            if (poll_result > 0 && (writable.revents & POLLOUT)) {
+                continue;
+            }
+        }
+        return -1;
+    }
+    return 0;
+}
+
 static void send_json_response(int fd, int cmd, json_object *resp) {
     json_object_object_add(resp, "cmd", json_object_new_int(cmd));
     const char *json_str = json_object_to_json_string(resp);
     char *payload = xor_base64_encode(json_str);
     int len = strlen(payload);
 
-    char sendbuf[len + MSG_HEAD_LEN + 1];
+    char *sendbuf = (char *)malloc((size_t)len + MSG_HEAD_LEN);
+    if (!sendbuf) {
+        free(payload);
+        return;
+    }
     int net_len = htonl(len);
     memcpy(sendbuf, &net_len, MSG_HEAD_LEN);
     memcpy(sendbuf + MSG_HEAD_LEN, payload, len);
 
     pthread_mutex_lock(&g_conn_lock);
-    send(fd, sendbuf, len + MSG_HEAD_LEN, MSG_NOSIGNAL);
+    if (send_all(fd, sendbuf, (size_t)len + MSG_HEAD_LEN) != 0) {
+        fprintf(stderr, "[send] fd=%d failed: %s\n", fd, strerror(errno));
+    }
     pthread_mutex_unlock(&g_conn_lock);
+    free(sendbuf);
     free(payload);
 }
 
@@ -828,12 +865,164 @@ static void handle_upload_finish(int fd, const char *data, int len, conn_info_t 
     json_object_put(resp);
 }
 
+static int load_video_file_info(int video_id, char *filename, size_t filename_size,
+                                char *filepath, size_t filepath_size,
+                                char *file_md5, size_t md5_size,
+                                long long *filesize) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT filename, filepath, filesize, file_md5 FROM videos WHERE id = ?";
+
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+
+    sqlite3_bind_int(stmt, 1, video_id);
+    int result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *db_filename = (const char *)sqlite3_column_text(stmt, 0);
+        const char *db_filepath = (const char *)sqlite3_column_text(stmt, 1);
+        const char *db_md5 = (const char *)sqlite3_column_text(stmt, 3);
+        snprintf(filename, filename_size, "%s", db_filename ? db_filename : "");
+        snprintf(filepath, filepath_size, "%s", db_filepath ? db_filepath : "");
+        snprintf(file_md5, md5_size, "%s", db_md5 ? db_md5 : "");
+        *filesize = sqlite3_column_int64(stmt, 2);
+        result = 0;
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+static void handle_download_init(int fd, const char *data, int len, conn_info_t *conn) {
+    (void)len;
+    json_object *jobj = json_tokener_parse(data);
+    if (!jobj) return;
+
+    json_object *resp = json_object_new_object();
+    if (check_auth(conn, resp) != 0) {
+        json_object_put(jobj);
+        send_json_response(fd, CMD_DOWNLOAD_INIT_RESP, resp);
+        json_object_put(resp);
+        return;
+    }
+
+    json_object *j_video_id = NULL;
+    json_object_object_get_ex(jobj, "video_id", &j_video_id);
+    int video_id = j_video_id ? json_object_get_int(j_video_id) : 0;
+    char filename[256] = {0};
+    char filepath[512] = {0};
+    char file_md5[128] = {0};
+    long long filesize = 0;
+    struct stat file_stat;
+
+    if (video_id <= 0 ||
+        load_video_file_info(video_id, filename, sizeof(filename), filepath,
+                             sizeof(filepath), file_md5, sizeof(file_md5),
+                             &filesize) != 0) {
+        json_object_object_add(resp, "result", json_object_new_string("fail"));
+        json_object_object_add(resp, "msg", json_object_new_string("视频不存在"));
+    } else if (stat(filepath, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+        json_object_object_add(resp, "result", json_object_new_string("fail"));
+        json_object_object_add(resp, "msg", json_object_new_string("视频文件不存在"));
+    } else if ((long long)file_stat.st_size != filesize) {
+        json_object_object_add(resp, "result", json_object_new_string("fail"));
+        json_object_object_add(resp, "msg", json_object_new_string("视频文件大小不一致"));
+    } else {
+        json_object_object_add(resp, "result", json_object_new_string("ok"));
+        json_object_object_add(resp, "video_id", json_object_new_int(video_id));
+        json_object_object_add(resp, "filename", json_object_new_string(filename));
+        json_object_object_add(resp, "filesize", json_object_new_int64(filesize));
+        json_object_object_add(resp, "file_md5", json_object_new_string(file_md5));
+        json_object_object_add(resp, "chunk_size", json_object_new_int(DOWNLOAD_CHUNK_SIZE));
+    }
+
+    json_object_put(jobj);
+    send_json_response(fd, CMD_DOWNLOAD_INIT_RESP, resp);
+    json_object_put(resp);
+}
+
+static void handle_download_chunk(int fd, const char *data, int len, conn_info_t *conn) {
+    (void)len;
+    json_object *jobj = json_tokener_parse(data);
+    if (!jobj) return;
+
+    json_object *resp = json_object_new_object();
+    if (check_auth(conn, resp) != 0) {
+        json_object_put(jobj);
+        send_json_response(fd, CMD_DOWNLOAD_CHUNK_RESP, resp);
+        json_object_put(resp);
+        return;
+    }
+
+    json_object *j_video_id = NULL;
+    json_object *j_offset = NULL;
+    json_object *j_size = NULL;
+    json_object_object_get_ex(jobj, "video_id", &j_video_id);
+    json_object_object_get_ex(jobj, "offset", &j_offset);
+    json_object_object_get_ex(jobj, "size", &j_size);
+    int video_id = j_video_id ? json_object_get_int(j_video_id) : 0;
+    long long offset = j_offset ? json_object_get_int64(j_offset) : -1;
+    int requested_size = j_size ? json_object_get_int(j_size) : 0;
+    char filename[256] = {0};
+    char filepath[512] = {0};
+    char file_md5[128] = {0};
+    long long filesize = 0;
+
+    if (video_id <= 0 ||
+        load_video_file_info(video_id, filename, sizeof(filename), filepath,
+                             sizeof(filepath), file_md5, sizeof(file_md5),
+                             &filesize) != 0) {
+        json_object_object_add(resp, "result", json_object_new_string("fail"));
+        json_object_object_add(resp, "msg", json_object_new_string("视频不存在"));
+    } else if (offset < 0 || offset >= filesize || requested_size <= 0 ||
+               requested_size > DOWNLOAD_CHUNK_SIZE) {
+        json_object_object_add(resp, "result", json_object_new_string("fail"));
+        json_object_object_add(resp, "msg", json_object_new_string("下载范围无效"));
+    } else {
+        long long remaining = filesize - offset;
+        int read_size = requested_size;
+        if (remaining < read_size) {
+            read_size = (int)remaining;
+        }
+
+        FILE *fp = fopen(filepath, "rb");
+        unsigned char *buffer = (unsigned char *)malloc(read_size);
+        if (!fp || !buffer || fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+            if (fp) fclose(fp);
+            free(buffer);
+            json_object_object_add(resp, "result", json_object_new_string("fail"));
+            json_object_object_add(resp, "msg", json_object_new_string("无法读取视频文件"));
+        } else {
+            size_t bytes_read = fread(buffer, 1, read_size, fp);
+            fclose(fp);
+            if (bytes_read == 0) {
+                json_object_object_add(resp, "result", json_object_new_string("fail"));
+                json_object_object_add(resp, "msg", json_object_new_string("读取视频分片失败"));
+            } else {
+                char *chunk_b64 = base64_encode(buffer, (int)bytes_read);
+                json_object_object_add(resp, "result", json_object_new_string("ok"));
+                json_object_object_add(resp, "video_id", json_object_new_int(video_id));
+                json_object_object_add(resp, "offset", json_object_new_int64(offset));
+                json_object_object_add(resp, "data", json_object_new_string(chunk_b64));
+                json_object_object_add(resp, "eof",
+                    json_object_new_boolean(offset + (long long)bytes_read >= filesize));
+                free(chunk_b64);
+            }
+            free(buffer);
+        }
+    }
+
+    json_object_put(jobj);
+    send_json_response(fd, CMD_DOWNLOAD_CHUNK_RESP, resp);
+    json_object_put(resp);
+}
+
 static void handle_video_list(int fd, const char *data, int len, conn_info_t *conn) {
     json_object *resp = json_object_new_object();
     json_object *arr = json_object_new_array();
 
     sqlite3_stmt *stmt;
-    const char *sql = "SELECT v.id, v.filename, v.filepath, v.filesize, v.like_count, v.play_count, v.created_at, u.username FROM videos v JOIN users u ON v.user_id = u.id ORDER BY v.created_at DESC LIMIT 100";
+    const char *sql = "SELECT v.id, v.filename, v.filepath, v.filesize, v.file_md5, v.like_count, v.play_count, v.created_at, u.username FROM videos v JOIN users u ON v.user_id = u.id ORDER BY v.created_at DESC LIMIT 100";
     if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             json_object *item = json_object_new_object();
@@ -841,10 +1030,11 @@ static void handle_video_list(int fd, const char *data, int len, conn_info_t *co
             json_object_object_add(item, "filename", json_object_new_string((const char *)sqlite3_column_text(stmt, 1)));
             json_object_object_add(item, "filepath", json_object_new_string((const char *)sqlite3_column_text(stmt, 2)));
             json_object_object_add(item, "filesize", json_object_new_int64(sqlite3_column_int64(stmt, 3)));
-            json_object_object_add(item, "like_count", json_object_new_int(sqlite3_column_int(stmt, 4)));
-            json_object_object_add(item, "play_count", json_object_new_int(sqlite3_column_int(stmt, 5)));
-            json_object_object_add(item, "created_at", json_object_new_string((const char *)sqlite3_column_text(stmt, 6)));
-            json_object_object_add(item, "username", json_object_new_string((const char *)sqlite3_column_text(stmt, 7)));
+            json_object_object_add(item, "file_md5", json_object_new_string((const char *)sqlite3_column_text(stmt, 4)));
+            json_object_object_add(item, "like_count", json_object_new_int(sqlite3_column_int(stmt, 5)));
+            json_object_object_add(item, "play_count", json_object_new_int(sqlite3_column_int(stmt, 6)));
+            json_object_object_add(item, "created_at", json_object_new_string((const char *)sqlite3_column_text(stmt, 7)));
+            json_object_object_add(item, "username", json_object_new_string((const char *)sqlite3_column_text(stmt, 8)));
             json_object_array_add(arr, item);
         }
         sqlite3_finalize(stmt);
@@ -1549,6 +1739,8 @@ void server_run(const char *ip, int port) {
     register_msg_handler(CMD_UPLOAD_INIT, handle_upload_init);
     register_msg_handler(CMD_UPLOAD_CHUNK, handle_upload_chunk);
     register_msg_handler(CMD_UPLOAD_FINISH, handle_upload_finish);
+    register_msg_handler(CMD_DOWNLOAD_INIT, handle_download_init);
+    register_msg_handler(CMD_DOWNLOAD_CHUNK, handle_download_chunk);
     register_msg_handler(CMD_VIDEO_LIST, handle_video_list);
     register_msg_handler(CMD_VIDEO_LIKE, handle_video_like);
     register_msg_handler(CMD_VIDEO_PLAY, handle_video_play);

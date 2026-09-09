@@ -220,6 +220,22 @@
     <bool>false</bool>
    </property>
   </widget>
+  <widget class="QPushButton" name="pb_cancelDownload">
+   <property name="geometry">
+    <rect>
+     <x>780</x>
+     <y>110</y>
+     <width>100</width>
+     <height>28</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string>取消下载</string>
+   </property>
+   <property name="visible">
+    <bool>false</bool>
+   </property>
+  </widget>
   <widget class="QStackedWidget" name="stackedWidget">
    <property name="geometry">
     <rect>

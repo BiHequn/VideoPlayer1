@@ -10,6 +10,7 @@
 #include <QStandardPaths>
 #include <QDebug>
 #include <QFile>
+#include <QSaveFile>
 #include <QDateTime>
 #include <QThread>
 #include <QMetaObject>
@@ -80,17 +81,14 @@ OnlineDialog::OnlineDialog(NetworkClient *netClient, QWidget *parent)
     , ui(new Ui::OnlineDialog)
     , m_gifMovie(nullptr)
     , m_netClient(netClient)
+    , m_pendingDownloadVideoId(0)
+    , m_playAfterDownload(false)
 {
     ui->setupUi(this);
     this->setWindowTitle("在线视频平台");
     initUploadDir();
     loadGifList();
     loadFileList();
-    connect(ui->listWidget_download, &QListWidget::itemClicked,
-            this, &OnlineDialog::on_listWidget_itemClicked);
-    connect(ui->listWidget_download, &QListWidget::itemDoubleClicked,
-            this, &OnlineDialog::on_listWidget_itemDoubleClicked);
-
     if(m_netClient)
     {
         connect(m_netClient, &NetworkClient::videoListReceived,
@@ -107,11 +105,21 @@ OnlineDialog::OnlineDialog(NetworkClient *netClient, QWidget *parent)
                 this, &OnlineDialog::onUploadFinishResult);
         connect(m_netClient, &NetworkClient::uploadInitResult,
                 this, &OnlineDialog::onUploadInitResult);
+        connect(m_netClient, &NetworkClient::videoDownloadProgress,
+                this, &OnlineDialog::onVideoDownloadProgress);
+        connect(m_netClient, &NetworkClient::videoDownloadFinished,
+                this, &OnlineDialog::onVideoDownloadFinished);
+        connect(m_netClient, &NetworkClient::videoDownloadFailed,
+                this, &OnlineDialog::onVideoDownloadFailed);
     }
 }
 
 OnlineDialog::~OnlineDialog()
 {
+    if (m_netClient && m_pendingDownloadVideoId > 0) {
+        disconnect(m_netClient, nullptr, this, nullptr);
+        m_netClient->cancelVideoDownload();
+    }
     if(m_gifMovie)
     {
         m_gifMovie->stop();
@@ -169,6 +177,12 @@ void OnlineDialog::setNetworkClient(NetworkClient *client)
                 this, &OnlineDialog::onUploadFinishResult);
         connect(m_netClient, &NetworkClient::uploadInitResult,
                 this, &OnlineDialog::onUploadInitResult);
+        connect(m_netClient, &NetworkClient::videoDownloadProgress,
+                this, &OnlineDialog::onVideoDownloadProgress);
+        connect(m_netClient, &NetworkClient::videoDownloadFinished,
+                this, &OnlineDialog::onVideoDownloadFinished);
+        connect(m_netClient, &NetworkClient::videoDownloadFailed,
+                this, &OnlineDialog::onVideoDownloadFailed);
     }
 }
 
@@ -176,6 +190,9 @@ void OnlineDialog::on_pushButton_2_clicked()
 {
     if(!m_username.isEmpty())
     {
+        if (m_netClient && m_pendingDownloadVideoId > 0) {
+            m_netClient->cancelVideoDownload();
+        }
         emit SIG_logout();
     }
 }
@@ -300,6 +317,22 @@ void OnlineDialog::on_pushButton_9_clicked()
         QMessageBox::warning(this, "提示", "请先选择要下载的文件");
         return;
     }
+    const QString itemType = item->data(Qt::UserRole + 1).toString();
+    const int videoId = item->data(Qt::UserRole + 2).toInt();
+    const QString remoteFileName = item->data(Qt::UserRole + 3).toString();
+    if ((itemType == "server_video" || itemType == "recommend") && videoId > 0)
+    {
+        const QString defaultName = remoteFileName.isEmpty()
+            ? QString("video_%1").arg(videoId) : remoteFileName;
+        const QString savePath = QFileDialog::getSaveFileName(
+            this, "保存文件",
+            QStandardPaths::writableLocation(QStandardPaths::DesktopLocation) + "/" + defaultName,
+            "所有文件 (*.*)");
+        if(savePath.isEmpty()) return;
+        startServerVideoDownload(item, false, savePath);
+        return;
+    }
+
     QString srcPath = item->data(Qt::UserRole).toString();
     if(srcPath.isEmpty())
     {
@@ -419,20 +452,17 @@ void OnlineDialog::on_listWidget_itemDoubleClicked(QListWidgetItem *item)
 
     int videoId = item->data(Qt::UserRole + 2).toInt();
     QString itemType = item->data(Qt::UserRole + 1).toString();
+    if ((itemType == "server_video" || itemType == "recommend") && videoId > 0)
+    {
+        startServerVideoDownload(item, true);
+        return;
+    }
     QFileInfo fi(filePath);
     QString suffix = fi.suffix().toLower();
     if(suffix == "mp4" || suffix == "avi" || suffix == "mkv" || suffix == "flv" ||
        suffix == "rmvb" || suffix == "mp3" || suffix == "mov" || suffix == "wmv")
     {
-        QString playPath = filePath;
-        if(m_netClient && m_netClient->isConnected() && videoId > 0 &&
-           (itemType == "server_video" || itemType == "recommend"))
-        {
-            m_netClient->reportVideoPlay(videoId);
-            m_netClient->likeVideo(videoId);
-            playPath = serverPlayableUrl(filePath);
-        }
-        emit SIG_openVideoPlayer(playPath);
+        emit SIG_openVideoPlayer(filePath);
         return;
     }
 
@@ -508,25 +538,31 @@ void OnlineDialog::loadServerStreamList()
     }
 }
 
-QString OnlineDialog::serverPlayableUrl(const QString &serverPath) const
+void OnlineDialog::startServerVideoDownload(QListWidgetItem *item, bool playAfterDownload,
+                                            const QString &savePath)
 {
-    QString path = serverPath;
-    if(path.startsWith("http://") || path.startsWith("https://") || path.startsWith("rtmp://"))
-    {
-        return path;
+    if (!item || !m_netClient || !m_netClient->isConnected()) {
+        QMessageBox::warning(this, "下载失败", "当前未连接媒体服务。");
+        return;
+    }
+    if (m_pendingDownloadVideoId > 0) {
+        QMessageBox::information(this, "提示", "已有视频正在下载，请稍候。");
+        return;
     }
 
-    const QString prefix = "data/uploads/";
-    if(path.startsWith(prefix))
-    {
-        path = path.mid(prefix.length());
+    const int videoId = item->data(Qt::UserRole + 2).toInt();
+    if (videoId <= 0) {
+        QMessageBox::warning(this, "下载失败", "视频编号无效。");
+        return;
     }
-    else if(path.startsWith("/"))
-    {
-        path = path.mid(1);
-    }
-
-    return "http://192.168.62.132:9000/" + path;
+    m_pendingDownloadVideoId = videoId;
+    m_playAfterDownload = playAfterDownload;
+    m_downloadSavePath = savePath;
+    ui->lb_uploadStatus->setText("正在下载: " + item->data(Qt::UserRole + 3).toString());
+    ui->progressBar->setValue(0);
+    ui->progressBar->setVisible(true);
+    ui->pb_cancelDownload->setVisible(true);
+    m_netClient->startVideoDownload(videoId);
 }
 
 void OnlineDialog::onVideoListReceived(const QJsonArray &videos)
@@ -542,6 +578,7 @@ void OnlineDialog::onVideoListReceived(const QJsonArray &videos)
         item->setData(Qt::UserRole, obj["filepath"].toString());
         item->setData(Qt::UserRole + 1, "server_video");
         item->setData(Qt::UserRole + 2, obj["id"].toInt());
+        item->setData(Qt::UserRole + 3, obj["filename"].toString());
         ui->listWidget_download->insertItem(insertPos++, item);
     }
 }
@@ -583,6 +620,7 @@ void OnlineDialog::onVideoRecommendReceived(const QJsonArray &videos)
         item->setData(Qt::UserRole, obj["filepath"].toString());
         item->setData(Qt::UserRole + 1, "recommend");
         item->setData(Qt::UserRole + 2, obj["id"].toInt());
+        item->setData(Qt::UserRole + 3, obj["filename"].toString());
         ui->listWidget->addItem(item);
     }
 }
@@ -640,4 +678,78 @@ void OnlineDialog::onUploadInitResult(const QString &result, int uploadId, qint6
     Q_UNUSED(uploadId);
     Q_UNUSED(uploadedSize);
     Q_UNUSED(chunkSize);
+}
+
+void OnlineDialog::onVideoDownloadProgress(int videoId, int percent)
+{
+    if (videoId != m_pendingDownloadVideoId) {
+        return;
+    }
+    ui->progressBar->setValue(percent);
+}
+
+void OnlineDialog::onVideoDownloadFinished(int videoId, const QString &localPath)
+{
+    if (videoId != m_pendingDownloadVideoId) {
+        return;
+    }
+
+    const bool shouldPlay = m_playAfterDownload;
+    const QString savePath = m_downloadSavePath;
+    m_pendingDownloadVideoId = 0;
+    m_playAfterDownload = false;
+    m_downloadSavePath.clear();
+    ui->progressBar->setVisible(false);
+    ui->pb_cancelDownload->setVisible(false);
+    ui->lb_uploadStatus->setText("下载完成");
+
+    if (!savePath.isEmpty()) {
+        QFile source(localPath);
+        QSaveFile destination(savePath);
+        if (!source.open(QIODevice::ReadOnly) ||
+            !destination.open(QIODevice::WriteOnly)) {
+            QMessageBox::warning(this, "保存失败", "无法将缓存视频复制到指定位置。");
+            return;
+        }
+        while (!source.atEnd()) {
+            const QByteArray chunk = source.read(64 * 1024);
+            if (chunk.isEmpty() || destination.write(chunk) != chunk.size()) {
+                destination.cancelWriting();
+                QMessageBox::warning(this, "保存失败", "无法将缓存视频复制到指定位置。");
+                return;
+            }
+        }
+        if (!destination.commit()) {
+            QMessageBox::warning(this, "保存失败", "无法将缓存视频复制到指定位置。");
+            return;
+        }
+        QMessageBox::information(this, "下载完成", "视频已保存到：" + savePath);
+    }
+    if (shouldPlay) {
+        if (m_netClient && m_netClient->isConnected()) {
+            m_netClient->reportVideoPlay(videoId);
+        }
+        emit SIG_openVideoPlayer(localPath);
+    }
+}
+
+void OnlineDialog::onVideoDownloadFailed(int videoId, const QString &message)
+{
+    if (videoId != m_pendingDownloadVideoId) {
+        return;
+    }
+    m_pendingDownloadVideoId = 0;
+    m_playAfterDownload = false;
+    m_downloadSavePath.clear();
+    ui->progressBar->setVisible(false);
+    ui->pb_cancelDownload->setVisible(false);
+    ui->lb_uploadStatus->setText("下载失败");
+    QMessageBox::warning(this, "下载失败", message);
+}
+
+void OnlineDialog::on_pb_cancelDownload_clicked()
+{
+    if (m_netClient) {
+        m_netClient->cancelVideoDownload();
+    }
 }

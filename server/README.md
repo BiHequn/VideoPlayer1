@@ -5,6 +5,10 @@ The desktop client uses two services on the same host:
 - FastAPI authentication service, port `8000` by default.
 - C media service, port `8888` by default.
 
+Remote videos are downloaded from the media service in authenticated chunks,
+verified by size and MD5, cached locally by the Qt client, and then played with
+the existing local-file player.
+
 ## Configuration
 
 Copy the example configuration and generate a private shared token secret:
@@ -37,3 +41,16 @@ specific Python interpreter, set `VIDEOPLAYER_PYTHON`, for example:
 ```bash
 VIDEOPLAYER_PYTHON=/path/to/venv/bin/python scripts/start.sh
 ```
+
+## Media download integration test
+
+Against a disposable media-service database, obtain an API access token and
+run:
+
+```bash
+python3 tests/media_download_e2e.py MEDIA_HOST 8888 ACCESS_TOKEN
+```
+
+The test uploads a generated multi-chunk file, lists it, downloads it through
+the authenticated chunk protocol, verifies its MD5, and checks unauthenticated,
+missing-video, and invalid-range rejection paths.
