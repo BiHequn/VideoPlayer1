@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app import database
 from app.main import app
-from app.security import ACCESS_TOKEN_SECRET
+from app.security import get_access_token_secret
 
 
 def register_test_user(client: TestClient) -> None:
@@ -51,7 +51,7 @@ def test_login_succeeds_with_valid_credentials(tmp_path, monkeypatch) -> None:
     signing_input = f"{header_part}.{payload_part}"
     expected_signature = base64.b64encode(
         hmac.new(
-            ACCESS_TOKEN_SECRET,
+            get_access_token_secret(),
             signing_input.encode("ascii"),
             hashlib.sha256,
         ).digest()

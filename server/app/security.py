@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 
@@ -10,7 +11,20 @@ ALGORITHM = "pbkdf2_sha256"
 ITERATIONS = 600_000
 SALT_BYTES = 16
 ACCESS_TOKEN_TTL_SECONDS = 7200
-ACCESS_TOKEN_SECRET = b"VideoPlayer_SecretKey_2026"
+TOKEN_SECRET_ENV = "VIDEOPLAYER_TOKEN_SECRET"
+MIN_TOKEN_SECRET_LENGTH = 32
+
+
+def get_access_token_secret() -> bytes:
+    secret = os.getenv(TOKEN_SECRET_ENV, "")
+
+    if len(secret) < MIN_TOKEN_SECRET_LENGTH:
+        raise RuntimeError(
+            f"{TOKEN_SECRET_ENV} must contain at least "
+            f"{MIN_TOKEN_SECRET_LENGTH} characters"
+        )
+
+    return secret.encode("utf-8")
 
 
 def hash_password(password: str) -> str:
@@ -66,7 +80,7 @@ def create_access_token(user_id: int, username: str) -> str:
     payload_part = base64.b64encode(payload_text.encode("utf-8")).decode("ascii")
     signing_input = f"{header_part}.{payload_part}"
     signature = hmac.new(
-        ACCESS_TOKEN_SECRET,
+        get_access_token_secret(),
         signing_input.encode("ascii"),
         hashlib.sha256,
     ).digest()

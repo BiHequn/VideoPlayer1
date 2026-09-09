@@ -3,3 +3,8 @@
 *.db
 *.sqlite
 *.sqlite3
+
+# Local service configuration and runtime files
+server/.env
+server/run/
+server/logs/

@@ -21,8 +21,8 @@ static sqlite3 *m_db = NULL;
 
 static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static const char *JWT_SECRET = "VideoPlayer_SecretKey_2026";
-static const char *JWT_REFRESH_SECRET = "VideoPlayer_RefreshKey_2026";
+static const char *JWT_SECRET = NULL;
+static const char *JWT_REFRESH_SECRET = NULL;
 static const char *NET_XOR_KEY = "VideoPlayer2026!";
 
 #define RECOMMEND_LIMIT 50
@@ -1523,6 +1523,16 @@ static void process_conn(void *arg) {
 
 void server_run(const char *ip, int port) {
     signal(SIGPIPE, SIG_IGN);
+
+    JWT_SECRET = getenv("VIDEOPLAYER_TOKEN_SECRET");
+    JWT_REFRESH_SECRET = getenv("VIDEOPLAYER_REFRESH_TOKEN_SECRET");
+    if (!JWT_SECRET || strlen(JWT_SECRET) < 32 ||
+        !JWT_REFRESH_SECRET || strlen(JWT_REFRESH_SECRET) < 32) {
+        fprintf(stderr,
+                "VIDEOPLAYER_TOKEN_SECRET and VIDEOPLAYER_REFRESH_TOKEN_SECRET "
+                "must each contain at least 32 characters.\n");
+        return;
+    }
 
     if (init_database() != 0) {
         fprintf(stderr, "Database init failed, server stopped.\n");
