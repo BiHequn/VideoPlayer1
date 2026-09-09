@@ -133,7 +133,7 @@ static char *generate_token(int uid, const char *secret, int expire_seconds) {
 static int verify_token_details(const char *token, const char *secret, int *out_uid,
                                 char *out_username, size_t username_size) {
     char *copy = strdup(token);
-    char *saveptr;
+    char *saveptr = NULL;
     char *h_b64 = strtok_r(copy, ".", &saveptr);
     char *p_b64 = strtok_r(NULL, ".", &saveptr);
     char *s_b64 = strtok_r(NULL, ".", &saveptr);
