@@ -524,6 +524,8 @@ static void handle_api_token_auth(int fd, const char *data, int len, conn_info_t
     const char *access_token = j_token ? json_object_get_string(j_token) : "";
 
     json_object *resp = json_object_new_object();
+    conn->uid = 0;
+    conn->access_token[0] = '\0';
     int api_uid = 0;
     char username[128] = {0};
     int rc = verify_token_details(access_token, JWT_SECRET, &api_uid,
@@ -592,11 +594,16 @@ static void handle_api_token_auth(int fd, const char *data, int len, conn_info_t
         }
 
         if (media_uid > 0) {
-            conn->uid = media_uid;
-            snprintf(conn->access_token, sizeof(conn->access_token), "%s", access_token);
-            json_object_object_add(resp, "result", json_object_new_string("ok"));
-            json_object_object_add(resp, "uid", json_object_new_int(media_uid));
-            json_object_object_add(resp, "username", json_object_new_string(username));
+            if (strlen(access_token) >= sizeof(conn->access_token)) {
+                json_object_object_add(resp, "result", json_object_new_string("fail"));
+                json_object_object_add(resp, "msg", json_object_new_string("登录令牌过长"));
+            } else {
+                conn->uid = media_uid;
+                snprintf(conn->access_token, sizeof(conn->access_token), "%s", access_token);
+                json_object_object_add(resp, "result", json_object_new_string("ok"));
+                json_object_object_add(resp, "uid", json_object_new_int(media_uid));
+                json_object_object_add(resp, "username", json_object_new_string(username));
+            }
         } else {
             json_object_object_add(resp, "result", json_object_new_string("fail"));
             json_object_object_add(resp, "msg", json_object_new_string("无法创建媒体用户"));
@@ -613,7 +620,13 @@ static void handle_api_token_auth(int fd, const char *data, int len, conn_info_t
 }
 
 static int check_auth(conn_info_t *conn, json_object *resp) {
-    if (conn->uid <= 0) {
+    int token_uid = 0;
+    int token_status = conn->access_token[0] == '\0'
+        ? -1
+        : verify_token(conn->access_token, JWT_SECRET, &token_uid);
+    if (conn->uid <= 0 || token_status != 0 || token_uid <= 0) {
+        conn->uid = 0;
+        conn->access_token[0] = '\0';
         json_object_object_add(resp, "result", json_object_new_string("fail"));
         json_object_object_add(resp, "msg", json_object_new_string("未登录或Token已过期"));
         return -1;
@@ -1019,12 +1032,19 @@ static void handle_download_chunk(int fd, const char *data, int len, conn_info_t
 
 static void handle_video_list(int fd, const char *data, int len, conn_info_t *conn) {
     json_object *resp = json_object_new_object();
+    if (check_auth(conn, resp) != 0) {
+        send_json_response(fd, CMD_VIDEO_LIST_RESP, resp);
+        json_object_put(resp);
+        return;
+    }
     json_object *arr = json_object_new_array();
 
-    sqlite3_stmt *stmt;
+    sqlite3_stmt *stmt = NULL;
     const char *sql = "SELECT v.id, v.filename, v.filepath, v.filesize, v.file_md5, v.like_count, v.play_count, v.created_at, u.username FROM videos v JOIN users u ON v.user_id = u.id ORDER BY v.created_at DESC LIMIT 100";
-    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int prepare_result = sqlite3_prepare_v2(m_db, sql, -1, &stmt, NULL);
+    int step_result = SQLITE_DONE;
+    if (prepare_result == SQLITE_OK) {
+        while ((step_result = sqlite3_step(stmt)) == SQLITE_ROW) {
             json_object *item = json_object_new_object();
             json_object_object_add(item, "id", json_object_new_int(sqlite3_column_int(stmt, 0)));
             json_object_object_add(item, "filename", json_object_new_string((const char *)sqlite3_column_text(stmt, 1)));
@@ -1040,7 +1060,11 @@ static void handle_video_list(int fd, const char *data, int len, conn_info_t *co
         sqlite3_finalize(stmt);
     }
 
-    json_object_object_add(resp, "result", json_object_new_string("ok"));
+    int list_succeeded = prepare_result == SQLITE_OK && step_result == SQLITE_DONE;
+    json_object_object_add(resp, "result", json_object_new_string(list_succeeded ? "ok" : "fail"));
+    if (!list_succeeded) {
+        json_object_object_add(resp, "msg", json_object_new_string("读取视频列表失败"));
+    }
     json_object_object_add(resp, "videos", arr);
     send_json_response(fd, CMD_VIDEO_LIST_RESP, resp);
     json_object_put(resp);
@@ -1051,9 +1075,10 @@ static void get_current_time_str(char *buf, size_t size) {
     strftime(buf, size, "%Y-%m-%d %H:%M:%S", localtime(&now));
 }
 
-static void record_user_action(int user_id, int video_id, const char *action_type, double weight) {
+static int record_user_action(sqlite3 *db, int user_id, int video_id,
+                              const char *action_type, double weight) {
     if (user_id <= 0 || video_id <= 0 || !action_type) {
-        return;
+        return -1;
     }
 
     char timebuf[64];
@@ -1063,28 +1088,37 @@ static void record_user_action(int user_id, int video_id, const char *action_typ
     const char *insert_sql =
         "INSERT OR IGNORE INTO user_actions (user_id, video_id, action_type, weight, created_at) "
         "VALUES (?, ?, ?, ?, ?)";
-    if (sqlite3_prepare_v2(m_db, insert_sql, -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, insert_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    {
         sqlite3_bind_int(stmt, 1, user_id);
         sqlite3_bind_int(stmt, 2, video_id);
         sqlite3_bind_text(stmt, 3, action_type, -1, SQLITE_STATIC);
         sqlite3_bind_double(stmt, 4, weight);
         sqlite3_bind_text(stmt, 5, timebuf, -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
+        int step_result = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
+        if (step_result != SQLITE_DONE) return -1;
     }
 
     const char *update_sql =
         "UPDATE user_actions SET weight = ?, created_at = ? "
         "WHERE user_id = ? AND video_id = ? AND action_type = ?";
-    if (sqlite3_prepare_v2(m_db, update_sql, -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, update_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    {
         sqlite3_bind_double(stmt, 1, weight);
         sqlite3_bind_text(stmt, 2, timebuf, -1, SQLITE_STATIC);
         sqlite3_bind_int(stmt, 3, user_id);
         sqlite3_bind_int(stmt, 4, video_id);
         sqlite3_bind_text(stmt, 5, action_type, -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
+        int step_result = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
+        if (step_result != SQLITE_DONE) return -1;
     }
+    return 0;
 }
 
 static int get_user_action_count(int user_id) {
@@ -1310,29 +1344,69 @@ static void handle_video_play(int fd, const char *data, int len, conn_info_t *co
     if (!jobj) return;
 
     json_object *resp = json_object_new_object();
+    if (check_auth(conn, resp) != 0) {
+        json_object_put(jobj);
+        send_json_response(fd, CMD_VIDEO_PLAY_RESP, resp);
+        json_object_put(resp);
+        return;
+    }
     json_object *j_vid = NULL;
     json_object_object_get_ex(jobj, "video_id", &j_vid);
     int video_id = j_vid ? json_object_get_int(j_vid) : 0;
 
+    int video_exists = 0;
+    int update_succeeded = 0;
+    int database_available = 0;
     if (video_id > 0) {
-        sqlite3_stmt *stmt;
-        if (sqlite3_prepare_v2(m_db, "UPDATE videos SET play_count = play_count + 1 WHERE id = ?", -1, &stmt, NULL) == SQLITE_OK) {
+        int transaction_started = 0;
+        sqlite3_stmt *stmt = NULL;
+        sqlite3 *play_db = NULL;
+        if (sqlite3_open("data/videoplayer.db", &play_db) == SQLITE_OK) {
+            database_available = 1;
+            sqlite3_busy_timeout(play_db, 5000);
+            transaction_started = sqlite3_exec(play_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
+        }
+        if (transaction_started &&
+            sqlite3_prepare_v2(play_db, "SELECT 1 FROM videos WHERE id = ?", -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_int(stmt, 1, video_id);
-            sqlite3_step(stmt);
+            video_exists = sqlite3_step(stmt) == SQLITE_ROW;
             sqlite3_finalize(stmt);
+            stmt = NULL;
         }
-        if (conn->uid > 0 &&
-            sqlite3_prepare_v2(m_db, "UPDATE users SET play_count = play_count + 1 WHERE id = ?", -1, &stmt, NULL) == SQLITE_OK) {
+        if (video_exists && sqlite3_prepare_v2(play_db, "UPDATE videos SET play_count = play_count + 1 WHERE id = ?", -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, video_id);
+            update_succeeded = sqlite3_step(stmt) == SQLITE_DONE;
+            sqlite3_finalize(stmt);
+            stmt = NULL;
+        }
+        if (update_succeeded &&
+            sqlite3_prepare_v2(play_db, "UPDATE users SET play_count = play_count + 1 WHERE id = ?", -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_int(stmt, 1, conn->uid);
-            sqlite3_step(stmt);
+            update_succeeded = sqlite3_step(stmt) == SQLITE_DONE;
             sqlite3_finalize(stmt);
+            stmt = NULL;
+        } else if (update_succeeded) {
+            update_succeeded = 0;
         }
-        if (conn->uid > 0) {
-            record_user_action(conn->uid, video_id, "play", 1.0);
+        if (update_succeeded) {
+            update_succeeded = record_user_action(play_db, conn->uid, video_id, "play", 1.0) == 0;
         }
+        if (transaction_started && update_succeeded &&
+            sqlite3_exec(play_db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+            update_succeeded = 1;
+        } else if (transaction_started) {
+            sqlite3_exec(play_db, "ROLLBACK", NULL, NULL, NULL);
+            update_succeeded = 0;
+        }
+        if (play_db) sqlite3_close(play_db);
     }
 
-    json_object_object_add(resp, "result", json_object_new_string(video_id > 0 ? "ok" : "fail"));
+    json_object_object_add(resp, "result", json_object_new_string(update_succeeded ? "ok" : "fail"));
+    if (!update_succeeded) {
+        json_object_object_add(resp, "msg", json_object_new_string(
+            !database_available ? "播放统计数据库不可用" :
+            (video_exists ? "播放统计写入失败" : "视频不存在")));
+    }
     send_json_response(fd, CMD_VIDEO_PLAY_RESP, resp);
     json_object_put(resp);
     json_object_put(jobj);
@@ -1372,7 +1446,7 @@ static void handle_video_like(int fd, const char *data, int len, conn_info_t *co
         }
 
         if (inserted) {
-            record_user_action(conn->uid, video_id, "like", 10.0);
+            record_user_action(m_db, conn->uid, video_id, "like", 10.0);
             if (sqlite3_prepare_v2(m_db, "UPDATE videos SET like_count = like_count + 1 WHERE id = ?", -1, &stmt, NULL) == SQLITE_OK) {
                 sqlite3_bind_int(stmt, 1, video_id);
                 sqlite3_step(stmt);

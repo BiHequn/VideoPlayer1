@@ -126,9 +126,9 @@ def upload_fixture(connection, access_token):
         for video in listing.get("videos", [])
         if video.get("filename") == TEST_FILENAME
     ]
-    if len(matches) != 1:
+    if not matches:
         raise AssertionError("video fixture missing from list: {}".format(listing))
-    video = matches[0]
+    video = max(matches, key=lambda item: int(item.get("id", 0)))
     if video.get("file_md5") != file_md5 or int(video.get("filesize", -1)) != len(TEST_CONTENT):
         raise AssertionError("video metadata mismatch: {}".format(video))
     return int(video["id"]), file_md5
@@ -174,8 +174,23 @@ def download_fixture(connection, access_token, video_id, expected_md5):
 
 def validate_rejections(host, port, access_token, video_id):
     with socket.create_connection((host, port), timeout=5) as connection:
+        send_message(connection, {"cmd": 30})
+        expect_result(receive_message(connection), "fail", "unauthenticated video list")
         send_message(connection, {"cmd": 23, "video_id": video_id})
         expect_result(receive_message(connection), "fail", "unauthenticated download")
+        send_message(connection, {"cmd": 32, "video_id": video_id})
+        expect_result(receive_message(connection), "fail", "unauthenticated play report")
+
+    with socket.create_connection((host, port), timeout=5) as connection:
+        authenticate(connection, access_token)
+        send_message(connection, {"cmd": 6, "access_token": "invalid-token"})
+        expect_result(receive_message(connection), "fail", "invalid reauthentication")
+        send_message(connection, {"cmd": 30, "access_token": access_token})
+        expect_result(
+            receive_message(connection),
+            "fail",
+            "failed reauthentication clears the prior session",
+        )
 
     with socket.create_connection((host, port), timeout=5) as connection:
         authenticate(connection, access_token)

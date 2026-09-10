@@ -51,8 +51,8 @@ typedef struct conn_info {
     int send_len;
     time_t last_active;
     int uid;
-    char access_token[256];
-    char refresh_token[256];
+    char access_token[2048];
+    char refresh_token[2048];
 } conn_info_t;
 
 typedef void (*msg_handler_t)(int fd, const char *data, int len, conn_info_t *conn);
